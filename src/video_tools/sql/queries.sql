@@ -10,14 +10,14 @@ SELECT * FROM document WHERE id = :document_id;
 
 -- name: create_chunk
 -- Create a new chunk record
-INSERT INTO chunk (id, document_id, chunk_text, chunk_page, chunk_timestamp)
-VALUES (:id, :document_id, :chunk_text, :chunk_page, :chunk_timestamp)
+INSERT INTO chunk (id, document_id, chunk_text, chunk_page, chunk_timestamp, token_count, word_count, start_offset, end_offset)
+VALUES (:id, :document_id, :chunk_text, :chunk_page, :chunk_timestamp, :token_count, :word_count, :start_offset, :end_offset)
 RETURNING id;
 
 -- name: create_chunks_batch
 -- Create multiple chunks in a batch operation
-INSERT INTO chunk (id, document_id, chunk_text, chunk_page, chunk_timestamp)
-VALUES (:id, :document_id, :chunk_text, :chunk_page, :chunk_timestamp)
+INSERT INTO chunk (id, document_id, chunk_text, chunk_page, chunk_timestamp, token_count, word_count, start_offset, end_offset)
+VALUES (:id, :document_id, :chunk_text, :chunk_page, :chunk_timestamp, :token_count, :word_count, :start_offset, :end_offset)
 RETURNING id;
 
 -- name: get_chunks_by_document

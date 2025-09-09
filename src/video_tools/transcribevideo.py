@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.parse
 
 import azure.cognitiveservices.speech as speechsdk
 from tqdm import tqdm
 import yt_dlp
+import tiktoken
 
 from .database import DatabaseManager, create_document_from_video
 
@@ -55,6 +56,9 @@ class VideoTranscriber:
         # Configure logging
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
+        
+        # Initialize tiktoken for token counting
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
         
         # Initialize database manager
         try:
@@ -191,72 +195,42 @@ class VideoTranscriber:
             self.logger.error(f"FFmpeg error: {e.stderr}")
             raise RuntimeError(f"Failed to extract audio: {e.stderr}")
     
-    def chunk_audio(self, audio_path: str, chunk_duration: int = 30) -> List[str]:
+    def transcribe_full_audio(self, audio_path: str, language: str = 'en-US') -> Dict:
         """
-        Split audio into chunks for better transcription handling using FFmpeg.
+        Transcribe the entire audio file at once using Azure Speech-to-Text.
         
         Args:
             audio_path: Path to the audio file
-            chunk_duration: Duration of each chunk in seconds
+            language: Speech recognition language
             
         Returns:
-            List of paths to audio chunks
+            Dictionary containing full transcription results
         """
-        self.logger.info(f"Chunking audio into {chunk_duration}-second segments...")
+        self.logger.info(f"Transcribing full audio file: {audio_path}")
         
-        try:
-            # Use FFprobe to get duration (more reliable)
-            probe_cmd = [
-                self.ffmpeg_path.replace('ffmpeg', 'ffprobe'),
-                '-v', 'quiet',
-                '-show_entries', 'format=duration',
-                '-of', 'csv=p=0',
-                audio_path
-            ]
-            
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-            total_duration = float(result.stdout.strip())
-        except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-            # Fallback: assume 30 seconds if we can't get duration
-            self.logger.warning("Could not determine audio duration, using fallback chunking")
-            total_duration = 30.0
+        # Configure Azure Speech SDK
+        speech_config = speechsdk.SpeechConfig(
+            subscription=self.azure_key, 
+            region=self.azure_region
+        )
+        speech_config.speech_recognition_language = language
         
-        # Calculate number of chunks
-        num_chunks = int(total_duration / chunk_duration) + 1
+        # Configure audio input
+        audio_config = speechsdk.AudioConfig(filename=audio_path)
         
-        chunks = []
-        temp_dir = tempfile.gettempdir()
+        # Create speech recognizer
+        speech_recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config, 
+            audio_config=audio_config
+        )
         
-        for i in range(num_chunks):
-            start_time = i * chunk_duration
-            chunk_path = Path(temp_dir) / f"chunk_{i:03d}.wav"
-            
-            # Use FFmpeg to extract chunk
-            chunk_cmd = [
-                self.ffmpeg_path,
-                '-i', audio_path,
-                '-ss', str(start_time),
-                '-t', str(chunk_duration),
-                '-acodec', 'pcm_s16le',
-                '-ar', '16000',
-                '-ac', '1',
-                '-y',
-                str(chunk_path)
-            ]
-            
-            try:
-                subprocess.run(chunk_cmd, capture_output=True, text=True, check=True)
-                chunks.append(str(chunk_path))
-            except subprocess.CalledProcessError as e:
-                self.logger.warning(f"Failed to create chunk {i}: {e}")
-                continue
-        
-        self.logger.info(f"Created {len(chunks)} audio chunks")
-        return chunks
+        # Perform continuous recognition for the full audio
+        return self._continuous_recognition_full(speech_recognizer)
     
     def transcribe_chunk(self, audio_chunk_path: str, 
                         language: str = 'en-US',
                         enable_continuous_recognition: bool = True) -> Dict:
+                        
         """
         Transcribe a single audio chunk using Azure Speech-to-Text.
         
@@ -310,6 +284,131 @@ class VideoTranscriber:
             'status': 'success'
         }
     
+    def _continuous_recognition_full(self, speech_recognizer) -> Dict:
+        """Perform continuous speech recognition for full audio."""
+        results = []
+        done = False
+        
+        def handle_result(evt):
+            if evt.result.text:
+                results.append({
+                    'text': evt.result.text,
+                    'offset': evt.result.offset,
+                    'duration': evt.result.duration
+                })
+        
+        def handle_session_stopped(evt):
+            nonlocal done
+            self.logger.info("Session stopped")
+            done = True
+        
+        speech_recognizer.recognized.connect(handle_result)
+        speech_recognizer.session_stopped.connect(handle_session_stopped)
+        
+        # Start continuous recognition
+        speech_recognizer.start_continuous_recognition()
+        
+        # Create progress bar for transcription
+        import time
+        with tqdm(
+            desc="🎤 Transcribing audio", 
+            unit="segments", 
+            bar_format="{l_bar}{bar:30}{r_bar}",
+            colour="green",
+            ncols=80
+        ) as pbar:
+            pbar.total = None  # Unknown total, will show indefinite progress
+            last_count = 0
+            
+            # Wait for completion - wait until the session is stopped
+            while not done:
+                time.sleep(0.5)  # Check every 500ms
+                
+                # Update progress bar with current segment count
+                current_count = len(results)
+                if current_count > last_count:
+                    pbar.update(current_count - last_count)
+                    last_count = current_count
+                    pbar.set_postfix({
+                        "segments": f"{current_count}",
+                        "status": "🔄 Processing"
+                    })
+            
+            # Final update
+            pbar.set_postfix({
+                "segments": f"{len(results)}",
+                "status": "✅ Complete"
+            })
+        
+        # Stop recognition
+        speech_recognizer.stop_continuous_recognition()
+        
+        return {
+            'transcriptions': results,
+            'status': 'success'
+        }
+    
+    def _split_transcription_by_tokens(self, transcriptions: List[Dict], tokens_per_chunk: int = 250) -> List[Dict]:
+        """
+        Split transcription results into chunks based on token count.
+        
+        Args:
+            transcriptions: List of transcription segments
+            tokens_per_chunk: Target number of tokens per chunk
+            
+        Returns:
+            List of chunks with adjusted timestamps
+        """
+        if not transcriptions:
+            return []
+        
+        self.logger.info(f"Starting token-based chunking with {len(transcriptions)} segments")
+        chunks = []
+        current_chunk = {
+            'text': '',
+            'tokens': 0,
+            'start_offset': transcriptions[0]['offset'],
+            'end_offset': transcriptions[0]['offset']
+        }
+        
+        # Add progress bar for chunking
+        with tqdm(total=len(transcriptions), desc="✂️ Creating chunks", unit="segments", colour="blue") as pbar:
+            for segment in transcriptions:
+                segment_text = segment['text']
+                segment_tokens = len(self.tokenizer.encode(segment_text))
+                
+                # If adding this segment would exceed the token limit, start a new chunk
+                if current_chunk['tokens'] + segment_tokens > tokens_per_chunk and current_chunk['tokens'] > 0:
+                    # Finalize current chunk
+                    current_chunk['end_offset'] = segment['offset']
+                    chunks.append(current_chunk.copy())
+                    
+                    # Start new chunk
+                    current_chunk = {
+                        'text': segment_text,
+                        'tokens': segment_tokens,
+                        'start_offset': segment['offset'],
+                        'end_offset': segment['offset'] + segment['duration']
+                    }
+                else:
+                    # Add to current chunk
+                    if current_chunk['text']:
+                        current_chunk['text'] += ' ' + segment_text
+                    else:
+                        current_chunk['text'] = segment_text
+                    current_chunk['tokens'] += segment_tokens
+                    current_chunk['end_offset'] = segment['offset'] + segment['duration']
+                
+                pbar.update(1)
+                pbar.set_postfix({"chunks": len(chunks)})
+        
+        # Add the last chunk if it has content
+        if current_chunk['tokens'] > 0:
+            chunks.append(current_chunk)
+        
+        self.logger.info(f"Created {len(chunks)} token-based chunks")
+        return chunks
+    
     def _single_recognition(self, speech_recognizer) -> Dict:
         """Perform single speech recognition."""
         result = speech_recognizer.recognize_once()
@@ -333,7 +432,7 @@ class VideoTranscriber:
     def transcribe_video_to_database(self,
                                    video_path: str,
                                    language: str = 'en-US',
-                                   chunk_duration: int = 30,
+                                   tokens_per_chunk: int = 250,
                                    doc_title: Optional[str] = None,
                                    doc_authors: Optional[List[str]] = None,
                                    doc_keywords: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -341,9 +440,9 @@ class VideoTranscriber:
         Transcribe a video file and store results in the database.
         
         Args:
-            video_path: Path to the video file
+            video_path: Path to the video file or URL
             language: Speech recognition language
-            chunk_duration: Duration of audio chunks in seconds
+            tokens_per_chunk: Target number of tokens per chunk
             doc_title: Document title (defaults to filename)
             doc_authors: List of authors
             doc_keywords: List of keywords
@@ -366,41 +465,53 @@ class VideoTranscriber:
                 doc_keywords=doc_keywords
             )
             
+            # Verify document was created successfully
+            self.logger.info(f"Created document: {document_id}")
+            doc_check = self.db_manager.get_document(document_id)
+            if not doc_check:
+                raise RuntimeError(f"Document {document_id} was not found after creation")
+            
+            # Small delay to ensure transaction is committed
+            import time
+            time.sleep(0.5)
+            
             # Extract audio from video
             audio_path = self.extract_audio(video_path)
             
-            # Chunk audio for processing
-            audio_chunks = self.chunk_audio(audio_path, chunk_duration)
+            # Transcribe the entire audio file
+            self.logger.info("Transcribing full audio file...")
+            transcription_result = self.transcribe_full_audio(audio_path, language)
             
-            # Transcribe each chunk and prepare for database storage
+            if transcription_result['status'] != 'success':
+                raise RuntimeError("Transcription failed")
+            
+            # Split transcription into token-based chunks
+            self.logger.info(f"Received {len(transcription_result['transcriptions'])} transcription segments")
+            print(f"\n📝 Splitting transcription into chunks of ~{tokens_per_chunk} tokens each...")
+            token_chunks = self._split_transcription_by_tokens(
+                transcription_result['transcriptions'], 
+                tokens_per_chunk
+            )
+            
+            # Prepare chunks for database storage
             all_transcriptions = []
-            current_offset = 0
             
-            for i, chunk_path in enumerate(tqdm(audio_chunks, desc="Transcribing chunks")):
-                chunk_result = self.transcribe_chunk(chunk_path, language)
+            for i, chunk in enumerate(token_chunks):
+                # Convert offset from ticks (100-nanosecond units) to datetime for database storage
+                chunk_timestamp = datetime.fromtimestamp(chunk['start_offset'] / 10_000_000, tz=timezone.utc)
                 
-                if chunk_result['status'] == 'success':
-                    for trans in chunk_result['transcriptions']:
-                        # Adjust timestamps for chunk position
-                        adjusted_trans = trans.copy()
-                        adjusted_trans['offset'] += current_offset
-                        
-                        # Convert offset to datetime for database storage
-                        chunk_timestamp = datetime.utcfromtimestamp(adjusted_trans['offset'] / 1000)
-                        
-                        all_transcriptions.append({
-                            'text': adjusted_trans['text'],
-                            'page': i + 1,  # Use chunk index as page number
-                            'timestamp': chunk_timestamp
-                        })
+                # Calculate word count
+                word_count = len(chunk['text'].split())
                 
-                current_offset += chunk_duration * 1000  # Convert to milliseconds
-                
-                # Clean up chunk file
-                try:
-                    os.remove(chunk_path)
-                except OSError:
-                    pass
+                all_transcriptions.append({
+                    'text': chunk['text'],
+                    'page': i + 1,  # Use chunk index as page number
+                    'timestamp': chunk_timestamp,
+                    'token_count': chunk['tokens'],
+                    'word_count': word_count,
+                    'start_offset': chunk['start_offset'] // 10_000,  # Convert ticks to milliseconds
+                    'end_offset': chunk['end_offset'] // 10_000  # Convert ticks to milliseconds
+                })
             
             # Clean up extracted audio
             try:
@@ -409,7 +520,12 @@ class VideoTranscriber:
                 pass
             
             # Store chunks in database
+            print(f"\n💾 Storing {len(all_transcriptions)} chunks in database...")
             chunk_ids = self.db_manager.create_chunks_batch(document_id, all_transcriptions)
+            
+            # Small delay to prevent connection pool exhaustion
+            import time
+            time.sleep(0.5)
             
             # Get document stats
             doc_stats = self.db_manager.get_document_stats(document_id)
@@ -418,11 +534,14 @@ class VideoTranscriber:
                 'document_id': document_id,
                 'chunk_count': len(chunk_ids),
                 'transcription_segments': len(all_transcriptions),
+                'total_tokens': sum(chunk['token_count'] for chunk in all_transcriptions),
+                'tokens_per_chunk': tokens_per_chunk,
                 'document_stats': doc_stats,
                 'status': 'success'
             }
             
             self.logger.info(f"Transcription completed and stored in database. Document ID: {document_id}")
+            self.logger.info(f"Created {len(chunk_ids)} chunks with ~{tokens_per_chunk} tokens each")
             return result
                 
         except Exception as e:
@@ -471,7 +590,7 @@ class VideoTranscriber:
                         adjusted_trans['offset'] += current_offset
                         all_transcriptions.append(adjusted_trans)
                 
-                current_offset += chunk_duration * 1000  # Convert to milliseconds
+                current_offset += chunk_duration * 1000  # Convert seconds to milliseconds
                 
                 # Clean up chunk file
                 try:
@@ -561,8 +680,8 @@ def main():
     parser.add_argument('-f', '--format', choices=['json', 'srt', 'vtt', 'txt'], 
                        default='json', help='Output format')
     parser.add_argument('-l', '--language', default='en-US', help='Speech recognition language')
-    parser.add_argument('-c', '--chunk-duration', type=int, default=30, 
-                       help='Audio chunk duration in seconds')
+    parser.add_argument('-t', '--tokens-per-chunk', type=int, default=250, 
+                       help='Target number of tokens per chunk')
     parser.add_argument('--database', action='store_true', 
                        help='Store transcription results in database')
     parser.add_argument('--title', help='Document title for database storage')
@@ -580,7 +699,7 @@ def main():
             result = transcriber.transcribe_video_to_database(
                 video_path=args.video_path,
                 language=args.language,
-                chunk_duration=args.chunk_duration,
+                tokens_per_chunk=args.tokens_per_chunk,
                 doc_title=args.title,
                 doc_authors=args.authors,
                 doc_keywords=args.keywords
@@ -590,6 +709,8 @@ def main():
             print(f"Document ID: {result['document_id']}")
             print(f"Chunks created: {result['chunk_count']}")
             print(f"Transcription segments: {result['transcription_segments']}")
+            print(f"Total tokens: {result['total_tokens']}")
+            print(f"Tokens per chunk: {result['tokens_per_chunk']}")
             
             # Also save to file if output specified
             if args.output:
@@ -598,7 +719,7 @@ def main():
                     video_path=args.video_path,
                     output_format=args.format,
                     language=args.language,
-                    chunk_duration=args.chunk_duration
+                    chunk_duration=30  # Keep default for file output
                 )
                 with open(args.output, 'w', encoding='utf-8') as f:
                     f.write(file_result)
@@ -609,7 +730,7 @@ def main():
                 video_path=args.video_path,
                 output_format=args.format,
                 language=args.language,
-                chunk_duration=args.chunk_duration
+                chunk_duration=30  # Keep default for file output
             )
             
             # Output result

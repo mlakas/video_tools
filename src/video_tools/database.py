@@ -9,7 +9,7 @@ This module provides:
 
 import os
 import uuid
-import asyncio
+import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -61,6 +61,12 @@ class DatabaseManager:
         # Test connection
         self._test_connection()
     
+    def close_all_connections(self):
+        """Close any remaining connections (for cleanup)."""
+        # This is a placeholder - psycopg2 connections are managed per operation
+        # In a production environment, you might want to implement connection pooling
+        pass
+    
     def _test_connection(self) -> None:
         """Test database connection."""
         try:
@@ -74,8 +80,27 @@ class DatabaseManager:
             raise RuntimeError(f"Failed to connect to database: {e}")
     
     def _get_connection(self):
-        """Get a database connection."""
-        return psycopg2.connect(**self.connection_params)
+        """Get a database connection with retry logic."""
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                conn = psycopg2.connect(**self.connection_params)
+                # Set connection to autocommit=False for transaction control
+                conn.autocommit = False
+                return conn
+            except psycopg2.OperationalError as e:
+                if "remaining connection slots" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Connection attempt {attempt + 1} failed due to connection limit. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"Failed to connect to database after {max_retries} attempts: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected database connection error: {e}")
+                raise
     
     def create_document(self, 
                        name: str,
@@ -108,7 +133,7 @@ class DatabaseManager:
         
         with self._get_connection() as conn:
             try:
-                result = list(self.queries.create_document(
+                list(self.queries.create_document(
                     conn,
                     id=document_id,
                     name=name,
@@ -152,7 +177,11 @@ class DatabaseManager:
                     document_id: str,
                     chunk_text: str,
                     chunk_page: Optional[int] = None,
-                    chunk_timestamp: Optional[datetime] = None) -> str:
+                    chunk_timestamp: Optional[datetime] = None,
+                    token_count: Optional[int] = None,
+                    word_count: Optional[int] = None,
+                    start_offset: Optional[int] = None,
+                    end_offset: Optional[int] = None) -> str:
         """
         Create a new chunk record.
         
@@ -161,6 +190,10 @@ class DatabaseManager:
             chunk_text: Text content of the chunk
             chunk_page: Page number (optional)
             chunk_timestamp: Timestamp for the chunk (optional)
+            token_count: Number of tokens in the chunk (optional)
+            word_count: Number of words in the chunk (optional)
+            start_offset: Start offset in milliseconds (optional)
+            end_offset: End offset in milliseconds (optional)
             
         Returns:
             Chunk ID
@@ -169,13 +202,17 @@ class DatabaseManager:
         
         with self._get_connection() as conn:
             try:
-                result = list(self.queries.create_chunk(
+                list(self.queries.create_chunk(
                     conn,
                     id=chunk_id,
                     document_id=document_id,
                     chunk_text=chunk_text,
                     chunk_page=chunk_page,
-                    chunk_timestamp=chunk_timestamp or datetime.utcnow()
+                    chunk_timestamp=chunk_timestamp or datetime.utcnow(),
+                    token_count=token_count,
+                    word_count=word_count,
+                    start_offset=start_offset,
+                    end_offset=end_offset
                 ))
                 conn.commit()
                 logger.info(f"Created chunk: {chunk_id}")
@@ -204,18 +241,24 @@ class DatabaseManager:
             try:
                 for chunk_data in chunks_data:
                     chunk_id = str(uuid.uuid4())
-                    result = list(self.queries.create_chunk(
+                    list(self.queries.create_chunk(
                         conn,
                         id=chunk_id,
                         document_id=document_id,
                         chunk_text=chunk_data['text'],
                         chunk_page=chunk_data.get('page'),
-                        chunk_timestamp=chunk_data.get('timestamp', datetime.utcnow())
+                        chunk_timestamp=chunk_data.get('timestamp', datetime.utcnow()),
+                        token_count=chunk_data.get('token_count'),
+                        word_count=chunk_data.get('word_count'),
+                        start_offset=chunk_data.get('start_offset'),
+                        end_offset=chunk_data.get('end_offset')
                     ))
                     chunk_ids.append(chunk_id)
                 
                 conn.commit()
                 logger.info(f"Created {len(chunk_ids)} chunks for document: {document_id}")
+                # Small delay to prevent connection pool exhaustion
+                time.sleep(0.1)
                 return chunk_ids
             except Exception as e:
                 conn.rollback()
